@@ -5,6 +5,10 @@ require("dotenv").config();
 const port = process.env.PORT || 5000;
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const path = require("path");
+const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
+const { body, validationResult } = require("express-validator");
+const sanitizeHtml = require("sanitize-html");
 
 // Middleware
 app.use(
@@ -16,9 +20,30 @@ app.use(
 app.use(express.json());
 app.use(express.static("public"));
 
+// Rate Limiting Middleware
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+});
+app.use(limiter);
+
+const verifyToken = (req, res, next) => {
+  if (!req.headers.authorization) {
+    return res.status(401).send({ message: "unauthorized access" });
+  }
+
+  const token = req.headers.authorization.split(" ")[1];
+  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(401).send({ message: "forbidden access" });
+    }
+    req.decoded = decoded;
+    next();
+  });
+};
+
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.g9xsrko.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
-// Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -29,49 +54,63 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    // Connect the client to the server
     await client.connect();
 
     const usersCollection = client.db("blogsDB").collection("users");
     const blogsCollection = client.db("blogsDB").collection("blogs");
 
-    // GET all users
-    app.get("/users", async (req, res) => {
+    app.post("/jwt", async (req, res) => {
+      const user = req.body;
+      const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
+        expiresIn: "1h",
+      });
+      res.send({ token });
+    });
+
+    app.get("/users", verifyToken, async (req, res) => {
       const result = await usersCollection.find().toArray();
       res.send(result);
     });
 
-    // POST a new user
-    app.post("/users", async (req, res) => {
-      try {
-        const { name, email, password } = req.body;
-        const newUser = { name, email, password };
-
-        // Insert the new user
-        await usersCollection.insertOne(newUser);
-
-        res.status(201).json(newUser);
-      } catch (error) {
-        console.error("Error creating user:", error);
-        res.status(500).json({ error: "Failed to create user" });
+    app.post(
+      "/users",
+      [
+        body("name").notEmpty().trim().escape(),
+        body("email").isEmail().normalizeEmail(),
+        body("password").notEmpty().trim().escape(),
+        (req, res, next) => {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) {
+            return res.status(400).json({ errors: errors.array() });
+          }
+          next();
+        },
+      ],
+      async (req, res) => {
+        try {
+          const { name, email, password } = req.body;
+          const newUser = { name, email, password };
+          await usersCollection.insertOne(newUser);
+          res.status(201).json(newUser);
+        } catch (error) {
+          console.error("Error creating user:", error);
+          res.status(500).json({ error: "Failed to create user" });
+        }
       }
-    });
+    );
 
-    // POST a new blog
     app.post("/blogs", async (req, res) => {
       try {
         const { title, content, authorEmail, thumbnail } = req.body;
         const newBlog = {
-          title,
-          content,
+          title: sanitizeHtml(title),
+          content: sanitizeHtml(content),
           authorEmail,
           thumbnail,
         };
 
-        // Insert the new blog
         const result = await blogsCollection.insertOne(newBlog);
-        newBlog._id = result.insertedId; // Assign the inserted ID to the new blog
-
+        newBlog._id = result.insertedId;
         res.status(201).json(newBlog);
       } catch (error) {
         console.error("Error creating blog:", error);
@@ -80,15 +119,29 @@ async function run() {
     });
 
     app.get("/blogs", async (req, res) => {
-      const result = await blogsCollection.find().toArray();
-      res.send(result);
+      const page = parseInt(req.query.page) || 1;
+      const limit = 2;
+      const skip = (page - 1) * limit;
+
+      try {
+        const totalBlogs = await blogsCollection.countDocuments();
+        const totalPages = Math.ceil(totalBlogs / limit);
+        const result = await blogsCollection
+          .find()
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+        res.send({ blogs: result, totalPages });
+      } catch (error) {
+        console.error("Error fetching blogs:", error);
+        res.status(500).json({ error: "Failed to fetch blogs" });
+      }
     });
 
-    // Implement the DELETE endpoint
     app.delete("/blogs/:id", async (req, res) => {
       try {
         const id = req.params.id;
-        await blogsCollection.deleteOne({ _id: new ObjectId(id) }); 
+        await blogsCollection.deleteOne({ _id: new ObjectId(id) });
         res.status(204).send();
       } catch (error) {
         console.error("Error deleting blog:", error);
@@ -96,14 +149,13 @@ async function run() {
       }
     });
 
-    // Implement the PUT endpoint for editing blogs
     app.put("/blogs/:id", async (req, res) => {
       try {
         const id = req.params.id;
         const { title, content } = req.body;
         await blogsCollection.updateOne(
           { _id: id },
-          { $set: { title, content } }
+          { $set: { title: sanitizeHtml(title), content: sanitizeHtml(content) } }
         );
         res.status(200).send();
       } catch (error) {
@@ -112,13 +164,11 @@ async function run() {
       }
     });
 
-    // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log(
       "Pinged your deployment. You successfully connected to MongoDB!"
     );
   } finally {
-    // Ensure that the client will close when you finish/error
     // await client.close();
   }
 }
