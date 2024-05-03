@@ -21,8 +21,8 @@ app.use(express.static("public"));
 
 // Rate Limiting Middleware
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  windowMs: 15 * 60 * 1000, 
+  max: 100, 
 });
 app.use(limiter);
 
@@ -59,12 +59,23 @@ async function run() {
     const blogsCollection = client.db("blogsDB").collection("blogs");
     const commentsCollection = client.db("blogsDB").collection("comments");
 
+    app.get("/jwt", (req, res) => {
+      res.status(405).send({ message: "Method Not Allowed" });
+    });
+
     app.post("/jwt", async (req, res) => {
-      const user = req.body;
-      const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
-        expiresIn: "1h",
-      });
-      res.send({ token });
+      try {
+        const user = req.body;
+
+        const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
+          expiresIn: "1h",
+        });
+
+        res.send({ token });
+      } catch (error) {
+        console.error("Error generating JWT:", error);
+        res.status(500).json({ error: "Failed to generate JWT" });
+      }
     });
 
     // Users Endpoints
@@ -124,12 +135,24 @@ async function run() {
       const page = parseInt(req.query.page) || 1;
       const limit = 2;
       const skip = (page - 1) * limit;
+      const searchQuery = req.query.searchQuery;
 
       try {
-        const totalBlogs = await blogsCollection.countDocuments();
+        let query = {};
+
+        if (searchQuery) {
+          query = {
+            $or: [
+              { title: { $regex: searchQuery, $options: "i" } },
+              { content: { $regex: searchQuery, $options: "i" } },
+            ],
+          };
+        }
+
+        const totalBlogs = await blogsCollection.countDocuments(query);
         const totalPages = Math.ceil(totalBlogs / limit);
         const result = await blogsCollection
-          .find()
+          .find(query)
           .skip(skip)
           .limit(limit)
           .toArray();
@@ -151,27 +174,36 @@ async function run() {
       }
     });
 
-    app.put("/blogs/:id", async (req, res) => {
+    
+    app.patch("/blogs/:id", verifyToken, async (req, res) => {
       try {
         const id = req.params.id;
         const { title, content } = req.body;
-        await blogsCollection.updateOne(
-          { _id: id },
-          {
-            $set: {
-              title: sanitizeHtml(title),
-              content: sanitizeHtml(content),
-            },
-          }
-        );
-        res.status(200).send();
+        const blog = await blogsCollection.findOne({ _id: new ObjectId(id) });
+
+        
+        if (req.decoded && req.decoded.email === blog.authorEmail) {
+          
+          await blogsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $set: {
+                title: sanitizeHtml(title),
+                content: sanitizeHtml(content),
+              },
+            }
+          );
+          res.status(200).send({ message: "Blog updated successfully" });
+        } else {
+          res
+            .status(403)
+            .json({ error: "You are not authorized to edit this blog" });
+        }
       } catch (error) {
         console.error("Error editing blog:", error);
         res.status(500).json({ error: "Failed to edit blog" });
       }
     });
-
-    // Comments Endpoints
 
     app.get("/comments", async (req, res) => {
       const result = await commentsCollection.find().toArray();
@@ -182,17 +214,15 @@ async function run() {
       try {
         const { content } = req.body;
         const { id } = req.params;
-        const { email } = req.decoded; // Extract email from decoded token
-    
-        // Create the comment with the extracted email
+        const { email } = req.decoded;
+
         const comment = {
           content: sanitizeHtml(content),
           blogId: id,
-          authorEmail: email, // Use extracted email as authorEmail
+          authorEmail: email,
           createdAt: new Date(),
         };
-    
-        // Insert the comment into the database
+
         const result = await commentsCollection.insertOne(comment);
         comment._id = result.insertedId;
         res.status(201).json(comment);
